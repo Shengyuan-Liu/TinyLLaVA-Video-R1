@@ -2,6 +2,7 @@ import os
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union
 
+import math
 import torch
 import torch.utils.data
 import transformers
@@ -209,12 +210,38 @@ class LLaVATrainer_Reason(Trainer):
         format_reward = rewards_per_func[:, 1]
         rewards = acc_reward + (2 * acc_reward - 1) * format_reward
         rewards = torch.where(rewards == 0, torch.tensor(-2.0, device=rewards.device, dtype=rewards.dtype), rewards)
-        
+
         """
         # Sum the rewards from all reward functions
         rewards = rewards_per_func.sum(dim=1) #torch.Size([num_generations])
         print("rewards:",rewards)
         """
+
+        # [NEW] GRPO-LEAD: 计算每个 prompt 组内的正确率 ρ_q
+        acc_grouped = acc_reward.view(-1, self.num_generations)  # [NEW] (num_prompts, G)
+        rho_q_per_prompt = (acc_grouped > 0).float().mean(dim=1)  # [NEW] 每个 prompt 的正确率
+        rho_q = rho_q_per_prompt.repeat_interleave(self.num_generations, dim=0)  # [NEW] 展开到每个 generation
+
+        # [NEW] Difficulty-Aware Length Penalty
+        # 核心思想: 难题(ρ小)允许长推理, 简单题(ρ大)惩罚长回答
+        comp_lengths = completion_mask.sum(dim=1).float()  # [NEW] 每个 generation 的 token 长度
+        # 组内 z-score 标准化长度
+        comp_lengths_grouped = comp_lengths.view(-1, self.num_generations)  # [NEW]
+        len_mean = comp_lengths_grouped.mean(dim=1, keepdim=True)  # [NEW]
+        len_std = comp_lengths_grouped.std(dim=1, keepdim=True) + 1e-8  # [NEW]
+        z_lengths = ((comp_lengths_grouped - len_mean) / len_std).view(-1)  # [NEW] 标准化长度偏差
+
+        # α 直接用准确率: 简单题 ρ≈1 惩罚长回答, 难题 ρ≈0 不限长
+        alpha = rho_q  # [NEW] α = ρ_q
+
+        # 正确答案: exp(-α * z), z>0(偏长)时衰减, z<0(偏短)时奖励
+        # 错误答案: 保持 -1, 不额外加长度惩罚(已经是负奖励了)
+        length_bonus = torch.exp(-alpha * z_lengths)  # [NEW]
+        is_correct = (acc_reward > 0).float()  # [NEW]
+        rewards = is_correct * length_bonus + (1 - is_correct) * (-1.0)  # [NEW] 替换原 rewards 中的 acc 部分
+        # 重新加上 format reward
+        rewards = rewards + (2 * is_correct - 1) * format_reward  # [NEW]
+        rewards = torch.where(rewards == 0, torch.tensor(-2.0, device=rewards.device, dtype=rewards.dtype), rewards)
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -225,6 +252,21 @@ class LLaVATrainer_Reason(Trainer):
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         #advantages = (rewards - mean_grouped_rewards)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4) #torch.Size([num_generations])
+
+        # [NEW] GRPO-LEAD: Difficulty-Aware Advantage Reweighting
+        _A = 0.4   # [NEW] w(ρ) 的下界
+        _B = 1.5   # [NEW] w(ρ) 的上界
+        _rho_0 = 0.75  # [NEW] sigmoid 中心点
+        _k = 10.0  # [NEW] sigmoid 陡峭度
+
+        # logistic reweighting: w(ρ) = A + (B - A) / (1 + exp[k(ρ - ρ_0)])
+        def _w(rho):  # [NEW]
+            return _A + (_B - _A) / (1.0 + torch.exp(_k * (rho - _rho_0)))  # [NEW]
+
+        pos_weight = _w(rho_q)       # [NEW] 难题（ρ小）-> w大 -> 放大正优势
+        neg_weight = _w(1.0 - rho_q) # [NEW] 简单题（ρ大, 1-ρ小）-> w大 -> 放大负优势
+        difficulty_weight = torch.where(advantages > 0, pos_weight, neg_weight)  # [NEW]
+        advantages = advantages * difficulty_weight  # [NEW]
 
         noise = torch.randn_like(advantages) * 0.02
         advantages = advantages + noise

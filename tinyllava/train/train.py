@@ -50,27 +50,37 @@ def _load_connector_settings(model_arguments):
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is correct using either symbolic verification or exact string matching."""
     contents = [completion[0]["content"] for completion in completions]
+
     rewards = []
+    # for content, sol in zip(contents, solution):
     for content, sol in zip(contents, solution):
-        reward = 0.0
+        # reward = 0.0
+        is_correct = False  # [NEW] 用布尔值替代直接赋 reward
         answer = parse(content)
         if float(verify(answer, parse(sol))) > 0:
-            reward = 1.0
+            # reward = 1.0
+            is_correct = True  # [NEW]
 
         # If symbolic verification failed, try string matching
-        if reward == 0.0:
+        # if reward == 0.0:
+        if not is_correct:  # [NEW]
             # Extract answer from solution if it has think/answer tags
             sol_match = re.search(r'<answer>(.*?)</answer>', sol)
             ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
-                
+
             # Extract answer from content if it has think/answer tags
             content_match = re.search(r'<answer>(.*?)</answer>', content)
             student_answer = content_match.group(1).strip() if content_match else content.strip()
-                
+
             # Compare the extracted answers
             if len(student_answer) > 0:
                 if student_answer == ground_truth or ground_truth==student_answer[0]:
-                    reward = 1.0  
+                    # reward = 1.0
+                    is_correct = True  # [NEW]
+
+        # [NEW] GRPO-LEAD: 正确 1.0，错误显式惩罚 -1（长度惩罚移至 trainer 中按难度动态调整）
+        reward = 1.0 if is_correct else -1.0  # [NEW]
+
         rewards.append(reward)
     return rewards
 
